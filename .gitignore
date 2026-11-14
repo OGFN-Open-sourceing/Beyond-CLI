@@ -1,0 +1,11 @@
+/target
+target/
+Cargo.lock
+dist/
+# npm package: assembled by npm/scripts/build.js
+npm/vendor/
+npm/ExtraResources/
+npm/LICENSE
+*.tgz
+*.rs.bk
+.env

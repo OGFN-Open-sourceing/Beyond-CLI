@@ -1,0 +1,45 @@
+{
+  "name": "beyond-cli",
+  "version": "0.1.0",
+  "description": "Beyond CLI — a fast, lightweight, galaxy-themed Claude coding agent for your terminal",
+  "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OGFN-Open-sourceing/Beyond-CLI.git"
+  },
+  "homepage": "https://github.com/OGFN-Open-sourceing/Beyond-CLI#readme",
+  "keywords": [
+    "claude",
+    "cli",
+    "ai",
+    "coding-agent",
+    "terminal",
+    "tui"
+  ],
+  "bin": {
+    "beyond": "bin/beyond.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "vendor",
+    "ExtraResources",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "prepack": "node scripts/build.js",
+    "postinstall": "node lib/install.js"
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "beyondBinary": {
+    "asset": "beyond-cli-win32-x64.exe",
+    "sha256": "e14108d750ab0e358530d3f39f54c1d5c462921c5f5aaf57bd3b2567e94ae2c0"
+  }
+}

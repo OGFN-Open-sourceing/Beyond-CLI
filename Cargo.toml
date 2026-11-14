@@ -1,0 +1,56 @@
+[package]
+name = "beyond-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Beyond CLI — a fast, lightweight, galaxy-themed Claude coding agent for your terminal"
+license = "GPL-3.0"
+repository = "https://github.com/OGFN-Open-sourceing/Beyond-CLI"
+readme = "README.md"
+rust-version = "1.88"
+
+# Three profiles, from fastest-to-build to smallest-binary:
+#   cargo build                 dev     — quick checks while editing
+#   cargo build --release       release — optimised, rebuilds in seconds
+#   cargo build --profile dist  dist    — what ships (npm / GitHub release)
+
+[profile.dev]
+# Line numbers in backtraces are enough; full debug info slows the linker.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies are never stepped through, so skip their debug info entirely.
+debug = false
+
+[profile.release]
+opt-level = "s"
+strip = true
+panic = "abort"
+# Only the files that changed are recompiled (off by default for release).
+incremental = true
+
+[profile.dist]
+inherits = "release"
+# Whole-program optimisation: smallest binary, but every build starts over.
+lto = true
+codegen-units = 1
+incremental = false
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29"
+dirs = "7.0.0"
+futures-util = "0.3.34"
+getrandom = "0.3"
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+regex = "1.13.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", default-features = false }
+sha2 = "0.10"
+sysinfo = "0.40.3"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "fs"] }
+unicode-width = "0.2.3"
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
