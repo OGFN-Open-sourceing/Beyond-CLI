@@ -1,0 +1,6 @@
+# GitHub language bar: count only the Rust source.
+# The npm wrapper and the preview script are packaging, not the app.
+*.rs linguist-detectable=true
+npm/** linguist-vendored
+docs/** linguist-documentation
+ExtraResources/** linguist-vendored

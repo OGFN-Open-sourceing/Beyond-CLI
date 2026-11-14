@@ -8,6 +8,7 @@ npm/ExtraResources/
 npm/LICENSE
 *.tgz
 *.rs.bk
+*.backup
 .env
 # personal notes and one-off scratch scripts (root only)
 /prompts.txt
