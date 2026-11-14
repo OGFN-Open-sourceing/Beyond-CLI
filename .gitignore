@@ -9,3 +9,8 @@ npm/LICENSE
 *.tgz
 *.rs.bk
 .env
+# personal notes and one-off scratch scripts (root only)
+/prompts.txt
+/debug.py
+/test.py
+/fix_*.py
