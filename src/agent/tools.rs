@@ -112,17 +112,9 @@ impl ToolRegistry {
             "write_skill" => self.t_write_skill(input).await,
             "env_detect" => self.t_env_detect().await,
             "env_install" => self.t_env_install(input).await,
-            other => {
-                // MCP passthrough: "mcp:<server>/<tool>"
-                if let Some(rest) = other.strip_prefix("mcp:") {
-                    let (server, tool) = match rest.split_once('/') {
-                        Some(p) => p,
-                        None => return ToolOutcome::err("malformed MCP tool name"),
-                    };
-                    return self.ctx.mcps.call_tool(server, tool, input).await;
-                }
-                ToolOutcome::err(format!("unknown tool '{other}'"))
-            }
+            // MCP passthrough: "mcp__<server>__<tool>"
+            other if other.starts_with("mcp__") => self.ctx.mcps.call_tool(other, input).await,
+            other => ToolOutcome::err(format!("unknown tool '{other}'")),
         }
     }
 }
@@ -255,6 +247,17 @@ fn builtin_defs() -> Vec<crate::agent::types::ToolDef> {
 
 // ------------------------------------------------------------ permissions
 
+impl ToolRegistry {
+    /// Apply a permission mode: run, refuse, or ask the user in the TUI.
+    async fn permitted(&self, mode: &PermMode, title: &str, detail: &str) -> bool {
+        match mode {
+            PermMode::Always => true,
+            PermMode::Deny => false,
+            PermMode::Ask => ask_user(&self.ctx, title, detail).await,
+        }
+    }
+}
+
 // --------------------------------------------------------------- executors
 
 impl ToolRegistry {
@@ -280,15 +283,7 @@ impl ToolRegistry {
         if command.trim().is_empty() {
             return ToolOutcome::err("missing 'command'");
         }
-        // Permission gate
-        let allowed = match self.ctx.perms.bash {
-            PermMode::Always => true,
-            PermMode::Deny => false,
-            PermMode::Ask => {
-                ask_user(&self.ctx, "Run command", &util::one_line(&command, 120)).await
-            }
-        };
-        if !allowed {
+        if !self.permitted(&self.ctx.perms.bash, "Run command", &util::one_line(&command, 120)).await {
             return ToolOutcome::err("command denied by user (permissions)");
         }
 
@@ -331,10 +326,16 @@ impl ToolRegistry {
                     text.push_str("\n[stderr]\n");
                     text.push_str(&util::truncate_chars(&stderr, 8_000));
                 }
+                let code = out.status.code().unwrap_or(-1);
                 if text.trim().is_empty() {
-                    text = format!("(no output, exit code {})", out.status.code().unwrap_or(0));
+                    text = "(no output)".into();
                 }
-                ToolOutcome::ok(text)
+                // without this the model can't tell a failed build from a
+                // passing one when both print something
+                if !out.status.success() {
+                    text.push_str(&format!("\n[exit code {code}]"));
+                }
+                ToolOutcome { text, is_error: !out.status.success() }
             }
         }
     }
@@ -388,14 +389,8 @@ impl ToolRegistry {
             return ToolOutcome::err("missing 'path' or 'content'");
         };
         let path = self.resolve(path);
-        let allowed = match self.ctx.perms.write {
-            PermMode::Always => true,
-            PermMode::Deny => false,
-            PermMode::Ask => {
-                ask_user(&self.ctx, "Write file", &util::truncate_chars(path.to_string_lossy().as_ref(), 120)).await
-            }
-        };
-        if !allowed {
+        let shown = util::truncate_chars(path.to_string_lossy().as_ref(), 120);
+        if !self.permitted(&self.ctx.perms.write, "Write file", &shown).await {
             return ToolOutcome::err("write denied by user (permissions)");
         }
         if let Some(parent) = path.parent() {
@@ -431,14 +426,8 @@ impl ToolRegistry {
                 "old_string matches {count} times — include more surrounding lines to make it unique"
             ));
         }
-        let allowed = match self.ctx.perms.write {
-            PermMode::Always => true,
-            PermMode::Deny => false,
-            PermMode::Ask => {
-                ask_user(&self.ctx, "Edit file", &util::truncate_chars(path.to_string_lossy().as_ref(), 120)).await
-            }
-        };
-        if !allowed {
+        let shown = util::truncate_chars(path.to_string_lossy().as_ref(), 120);
+        if !self.permitted(&self.ctx.perms.write, "Edit file", &shown).await {
             return ToolOutcome::err("edit denied by user (permissions)");
         }
         let updated = text.replacen(old, new, 1);
@@ -459,18 +448,25 @@ impl ToolRegistry {
             Ok(r) => r,
             Err(e) => return ToolOutcome::err(e),
         };
-        let mut out = Vec::new();
-        walk_files(&base, &mut |p| {
-            if out.len() >= 500 {
-                return;
-            }
-            if let Ok(rel) = p.strip_prefix(&base) {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                if re.is_match(&rel) {
-                    out.push(p.to_string_lossy().to_string());
+        // the walk is blocking disk work: keep it off the async workers
+        let root = base.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            walk_files(&root, &mut |p| {
+                if out.len() >= 500 {
+                    return;
                 }
-            }
-        });
+                if let Ok(rel) = p.strip_prefix(&root) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if re.is_match(&rel) {
+                        out.push(p.to_string_lossy().to_string());
+                    }
+                }
+            });
+            out
+        })
+        .await
+        .unwrap_or_default();
         if out.is_empty() {
             ToolOutcome::ok(format!("no files match '{pattern}' under {}", base.display()))
         } else {
@@ -495,37 +491,41 @@ impl ToolRegistry {
             Ok(r) => r,
             Err(e) => return ToolOutcome::err(format!("bad regex: {e}")),
         };
-        let mut out = Vec::new();
-        walk_files(&base, &mut |p| {
-            if out.len() >= 100 {
-                return;
-            }
-            if let Some(fg) = &file_glob {
-                let rel = p.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
-                if !fg.is_match(rel.as_ref()) {
+        // reading every file is blocking disk work: keep it off the async workers
+        let mut out = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            walk_files(&base, &mut |p| {
+                if out.len() >= 100 {
                     return;
                 }
-            }
-            // skip obvious binaries
-            let Ok(data) = std::fs::read(p) else { return };
-            if data.len() > 1_500_000 || data.contains(&0u8) {
-                return;
-            }
-            let text = String::from_utf8_lossy(&data);
-            for (i, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    out.push(format!(
-                        "{}:{}:{}",
-                        p.display(),
-                        i + 1,
-                        util::one_line(line, 200)
-                    ));
-                    if out.len() >= 100 {
+                if let Some(fg) = &file_glob {
+                    let rel = p.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
+                    if !fg.is_match(rel.as_ref()) {
                         return;
                     }
                 }
-            }
-        });
+                // skip big files without reading them, then obvious binaries
+                if std::fs::metadata(p).map(|m| m.len() > 1_500_000).unwrap_or(true) {
+                    return;
+                }
+                let Ok(data) = std::fs::read(p) else { return };
+                if data.contains(&0u8) {
+                    return;
+                }
+                let text = String::from_utf8_lossy(&data);
+                for (i, line) in text.lines().enumerate() {
+                    if re.is_match(line) {
+                        out.push(format!("{}:{}:{}", p.display(), i + 1, util::one_line(line, 200)));
+                        if out.len() >= 100 {
+                            return;
+                        }
+                    }
+                }
+            });
+            out
+        })
+        .await
+        .unwrap_or_default();
         if out.is_empty() {
             ToolOutcome::ok(format!("no matches for '{pattern}'"))
         } else {
@@ -570,11 +570,13 @@ impl ToolRegistry {
 
     async fn t_notify(&self, input: Value) -> crate::agent::types::ToolOutcome {
         use crate::agent::types::ToolOutcome;
-        let title = input["title"].as_str().unwrap_or("Beyond CLI");
-        let message = input["message"].as_str().unwrap_or("");
-        match util::send_toast(title, message) {
-            Ok(_) => ToolOutcome::ok("notification sent"),
-            Err(e) => ToolOutcome::err(format!("notification failed: {e:#}")),
+        let title = input["title"].as_str().unwrap_or("Beyond CLI").to_string();
+        let message = input["message"].as_str().unwrap_or("").to_string();
+        // spawns PowerShell and waits for it: run it off the async workers
+        match tokio::task::spawn_blocking(move || util::send_toast(&title, &message)).await {
+            Ok(Ok(_)) => ToolOutcome::ok("notification sent"),
+            Ok(Err(e)) => ToolOutcome::err(format!("notification failed: {e:#}")),
+            Err(e) => ToolOutcome::err(format!("notification failed: {e}")),
         }
     }
 
@@ -608,6 +610,11 @@ impl ToolRegistry {
         // a name made entirely of symbols would produce an empty filename
         let slug = if slug.is_empty() { "skill".to_string() } else { slug };
         let path = self.ctx.skills_dir.join(format!("{slug}.md"));
+        // a skill is injected into every future session's system prompt, so
+        // writing one is at least as consequential as editing a file
+        if !self.permitted(&self.ctx.perms.write, "Save skill", &format!("{slug}: {}", util::one_line(desc, 100))).await {
+            return ToolOutcome::err("saving the skill was denied by the user (permissions)");
+        }
         let content = format!("---\nname: {slug}\ndescription: {}\n---\n\n{md}\n", util::one_line(desc, 120));
         match tokio::fs::write(&path, content).await {
             Ok(_) => ToolOutcome::ok(format!(
@@ -628,19 +635,12 @@ impl ToolRegistry {
         let Some(name) = input["name"].as_str() else {
             return ToolOutcome::err("missing 'name'");
         };
-        let allowed = match self.ctx.perms.bash {
-            PermMode::Always => true,
-            PermMode::Deny => false,
-            PermMode::Ask => {
-                ask_user(&self.ctx, "Install toolchain", &format!("Install '{name}' on this machine")).await
-            }
-        };
-        if !allowed {
-            return ToolOutcome::err("install denied by user");
-        }
         let (cmd, via) = install_command(name);
         if cmd.is_empty() {
             return ToolOutcome::err(format!("unknown toolchain '{name}'"));
+        }
+        if !self.permitted(&self.ctx.perms.bash, "Install toolchain", &format!("Install '{name}' via {via}")).await {
+            return ToolOutcome::err("install denied by user");
         }
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(600),

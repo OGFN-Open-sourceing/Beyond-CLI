@@ -12,7 +12,7 @@ pub mod types;
 use crate::config::Config;
 use crate::mcp::McpManager;
 use crate::skills::{self, Skill};
-use client::{AnthropicClient, Auth, StreamEvent};
+use client::{AnthropicClient, StreamEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -53,17 +53,11 @@ impl Agent {
         confirm_tx: mpsc::UnboundedSender<tools::ConfirmRequest>,
         interrupt: Arc<AtomicBool>,
     ) -> Self {
-        let auth = if let Some(o) = &cfg.oauth {
-            // Claude account login wins over the (metered) API key.
-            Auth::OAuth {
-                access_token: o.access_token.clone(),
-                refresh_token: o.refresh_token.clone(),
-                expires_at: o.expires_at,
-            }
-        } else {
-            Auth::ApiKey(cfg.api_key.clone().unwrap_or_default())
-        };
-        let client = AnthropicClient::new(auth, cfg.model.clone(), cfg.max_tokens);
+        let client = AnthropicClient::new(
+            cfg.api_key.clone().unwrap_or_default(),
+            claude_code::api_model_id(&cfg.model),
+            cfg.max_tokens,
+        );
         let ctx = tools::ToolContext {
             cwd,
             perms: cfg.permissions.clone(),
@@ -156,12 +150,22 @@ impl Agent {
             if !text.is_empty() {
                 content.push(types::ContentBlock::Text { text });
             }
+            // tool calls whose arguments arrived as broken JSON (usually cut
+            // off by max_tokens): answered with an error instead of being run
+            // with empty arguments, which would do something nobody asked for
+            let mut broken: Vec<String> = Vec::new();
             for idx in &tool_order {
                 if let Some((id, name, json_raw)) = tool_blocks.get(idx) {
                     let input = if json_raw.trim().is_empty() {
                         serde_json::json!({})
                     } else {
-                        serde_json::from_str(json_raw).unwrap_or_else(|_| serde_json::json!({}))
+                        match serde_json::from_str::<serde_json::Value>(json_raw) {
+                            Ok(v) if v.is_object() => v,
+                            _ => {
+                                broken.push(id.clone());
+                                serde_json::json!({})
+                            }
+                        }
                     };
                     content.push(types::ContentBlock::ToolUse {
                         id: id.clone(),
@@ -189,6 +193,17 @@ impl Agent {
                     if interrupt.load(Ordering::Relaxed) {
                         interrupted = true;
                         break;
+                    }
+                    if broken.contains(id) {
+                        messages.push(Message::tool_result(
+                            id.clone(),
+                            "the arguments for this call were not valid JSON (the response was probably cut off) — \
+                             nothing was run; send the call again, split into smaller steps if it is large"
+                                .into(),
+                            true,
+                        ));
+                        executed.push(id.clone());
+                        continue;
                     }
                     let preview = tool_preview(name, input);
                     let _ = events.send(AgentEvent::ToolStart { name: name.clone(), preview });
@@ -310,7 +325,7 @@ pub fn build_system_prompt(cfg: &Config, skills: &[Skill], mcps: &McpManager, pr
         s.push_str("\n## MCP servers\nConnected: ");
         let names: Vec<String> = mcps.servers.iter().map(|x| format!("{} ({} tools)", x.name, x.tools.len())).collect();
         s.push_str(&names.join(", "));
-        s.push_str("\nTheir tools are exposed with `mcp:<server>/<tool>` names.\n");
+        s.push_str("\nTheir tools are exposed with `mcp__<server>__<tool>` names.\n");
     }
 
     // Self-learning directive

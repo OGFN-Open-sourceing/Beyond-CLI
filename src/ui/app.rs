@@ -422,10 +422,6 @@ impl App {
 
     /// Spawn the agent loop for the current conversation.
     fn start_turn(&mut self) {
-        // pick up tokens refreshed by an earlier turn
-        if let Some(live) = config::snapshot() {
-            self.cfg.oauth = live.oauth;
-        }
         let interrupt = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::unbounded_channel();
         if self.uses_claude() {

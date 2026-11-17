@@ -1,25 +1,27 @@
-//! First-run setup wizard — the "MSI-like" guided install experience.
+//! First-run setup wizard — a short guided setup before the chat opens.
 //!
-//! Runs as its own mini TUI before the main app when the config is missing
-//! an API key. Steps: welcome → API key → model → theme → window size →
-//! usage budget → confirm. Creates the ExtraResources folders with a sample
-//! skill so first launch is immediately useful.
+//! Steps: welcome → sign-in → (API key) → model → theme → window size →
+//! usage budget → confirm. Sign-in prefers the installed Claude Code CLI
+//! (its own login, your Claude plan); an Anthropic API key is the fallback.
+//! Also creates the ExtraResources folders with a sample skill.
 
-use crate::config::{Config, WindowConfig};
+use crate::agent::claude_code::{self, AuthStatus};
+use crate::config::{Backend, Config, WindowConfig};
 use crate::theme::{self, Theme};
 use crate::ui;
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use std::path::PathBuf;
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Step {
     Welcome,
-    AuthMethod,
-    Login,
+    SignIn,
     ApiKey,
     Model,
     Theme,
@@ -29,12 +31,8 @@ enum Step {
     Done,
 }
 
-const MODELS: [&str; 4] = [
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-20250929",
-    "claude-opus-4-5",
-    "claude-haiku-4-5",
-];
+/// The first four entries of `claude_code::MODELS` are the family aliases.
+const MODEL_CHOICES: usize = 4;
 
 const WINDOW_PRESETS: [(&str, u16, u16); 4] = [
     ("system default (don't resize)", 0, 0),
@@ -51,194 +49,200 @@ const BUDGETS: [(&str, Option<u64>); 5] = [
     ("2M tokens / day", Some(2_000_000)),
 ];
 
+/// Theme rows visible at once in the theme step.
+const THEME_ROWS: usize = 9;
+
+/// What the wizard knows about Claude Code on this PC.
+#[derive(Clone, PartialEq)]
+enum ClaudeState {
+    NotInstalled,
+    /// Installed; sign-in state still being checked.
+    Checking,
+    Ready(AuthStatus),
+}
+
 pub struct Installer {
     step: Step,
     pub cfg: Config,
     input: String,
+    /// Error shown under the API-key box (e.g. not an `sk-ant-` key).
+    input_error: Option<&'static str>,
+    signin_sel: usize,
     model_sel: usize,
     theme_sel: usize,
     window_sel: usize,
     budget_sel: usize,
-    auth_sel: usize,
-    preview_themes: [Theme; 2],
+    themes: Vec<Theme>,
     /// API key already available via the ANTHROPIC_API_KEY env var?
     api_key_from_env: bool,
-    /// Claude sign-in: URL to authorize + the PKCE verifier (state).
-    login_url: String,
-    login_verifier: String,
-    browser_opened: bool,
-    /// (pasted code, verifier) — exchanged by main after the wizard closes,
-    /// because the token endpoint call must run on the async runtime.
-    pub pending_login: Option<(String, String)>,
+    claude_cli: Option<PathBuf>,
+    claude: ClaudeState,
+    claude_rx: mpsc::Receiver<AuthStatus>,
+    claude_tx: mpsc::Sender<AuthStatus>,
+    /// The Claude Code sign-in window was opened from here.
+    login_opened: bool,
 }
 
 impl Installer {
     pub fn new(cfg: Config) -> Self {
-        let api_key_from_env = cfg.api_key.is_some();
-        Self {
+        let api_key_from_env = cfg.has_auth();
+        let themes = theme::builtins();
+        let theme_sel = themes.iter().position(|t| t.id == cfg.theme).unwrap_or(0);
+        let model_sel = claude_code::MODELS[..MODEL_CHOICES]
+            .iter()
+            .position(|(id, _)| *id == cfg.model)
+            .unwrap_or(2); // sonnet
+        // tests never look for (or run) a real Claude Code install
+        let claude_cli = if cfg!(test) { None } else { claude_code::find_cli() };
+        let (claude_tx, claude_rx) = mpsc::channel();
+        let me = Self {
             step: Step::Welcome,
             cfg,
             input: String::new(),
-            model_sel: 0,
-            theme_sel: 0,
-            window_sel: 2, // standard
+            input_error: None,
+            signin_sel: 0,
+            model_sel,
+            theme_sel,
+            window_sel: 0, // leave the console alone unless asked
             budget_sel: 0,
-            auth_sel: 0,
-            preview_themes: [theme::beyond(), theme::galaxy()],
+            themes,
             api_key_from_env,
-            login_url: String::new(),
-            login_verifier: String::new(),
-            browser_opened: false,
-            pending_login: None,
-        }
+            claude: if claude_cli.is_some() { ClaudeState::Checking } else { ClaudeState::NotInstalled },
+            claude_cli,
+            claude_rx,
+            claude_tx,
+            login_opened: false,
+        };
+        me.check_claude(1);
+        me
     }
 
-    /// Run the wizard in the given terminal.
-    ///
-    /// Returns `true` when the wizard finished (or was aborted) so the caller
-    /// can take over: read `self.cfg` / `take_pending_login()` afterwards.
-    pub fn run(&mut self, term: &mut ui::Tui) -> Result<bool> {
+    /// Ask Claude Code for its sign-in state off the UI thread; with
+    /// `attempts > 1`, keep asking until it reports signed in.
+    fn check_claude(&self, attempts: u32) {
+        let Some(cli) = self.claude_cli.clone() else { return };
+        let tx = self.claude_tx.clone();
+        std::thread::spawn(move || {
+            for i in 0..attempts {
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                let Some(status) = claude_code::auth_status(&cli) else { continue };
+                let done = status.logged_in;
+                if tx.send(status).is_err() || done {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn claude_signed_in(&self) -> bool {
+        matches!(&self.claude, ClaudeState::Ready(s) if s.logged_in)
+    }
+
+    /// Run the wizard until it finishes or is aborted; read `self.cfg` after.
+    pub fn run(&mut self, term: &mut ui::Tui) -> Result<()> {
         loop {
+            while let Ok(status) = self.claude_rx.try_recv() {
+                self.claude = ClaudeState::Ready(status);
+            }
             term.draw(|f| self.draw(f))?;
             if crossterm::event::poll(std::time::Duration::from_millis(50))?
+                // Windows reports key releases too; acting on them would
+                // run every key twice (Enter would skip a whole step).
                 && let Event::Key(key) = crossterm::event::read()?
-                    && self.on_key(key) {
-                        return Ok(true);
-                    }
+                && key.kind != KeyEventKind::Release
+                && self.on_key(key)
+            {
+                return Ok(());
+            }
         }
     }
 
+    /// Move a list selection up or down within `len` items.
+    fn nudge(sel: &mut usize, key: KeyCode, len: usize) {
+        match key {
+            KeyCode::Up => *sel = sel.saturating_sub(1),
+            KeyCode::Down => *sel = (*sel + 1).min(len.saturating_sub(1)),
+            _ => {}
+        }
+    }
+
+    /// Handle one key; `true` = the wizard is over.
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        let code = key.code;
         match self.step {
-            Step::Welcome => match key.code {
-                KeyCode::Enter => {
-                    self.step = Step::AuthMethod;
-                    false
-                }
-                KeyCode::Esc => true,
-                _ => false,
+            Step::Welcome => match code {
+                KeyCode::Enter => self.step = Step::SignIn,
+                KeyCode::Esc => return true,
+                _ => {}
             },
-            Step::AuthMethod => match key.code {
-                KeyCode::Up => {
-                    self.auth_sel = self.auth_sel.saturating_sub(1);
-                    false
-                }
-                KeyCode::Down => {
-                    self.auth_sel = (self.auth_sel + 1).min(1);
-                    false
-                }
-                KeyCode::Enter => match self.auth_sel {
-                    0 => {
-                        // Claude account: open the browser, collect the code
-                        let pkce = crate::auth::generate_pkce();
-                        self.login_url = crate::auth::authorize_url(&pkce);
-                        self.login_verifier = pkce.verifier;
-                        self.browser_opened = crate::auth::open_browser(&self.login_url).is_ok();
-                        self.step = Step::Login;
-                        false
+            Step::SignIn => match code {
+                KeyCode::Up | KeyCode::Down => Self::nudge(&mut self.signin_sel, code, 2),
+                KeyCode::Enter if self.signin_sel == 0 => {
+                    let Some(cli) = self.claude_cli.clone() else { return false };
+                    self.cfg.backend = Backend::Auto;
+                    if !self.claude_signed_in() && !self.login_opened {
+                        // Claude Code signs in with its own window; the app
+                        // picks the result up by itself later
+                        self.login_opened = claude_code::open_login_window(&cli).is_ok();
+                        self.check_claude(100);
                     }
-                    _ => {
-                        // API key (or the already-set env var)
-                        self.step = if self.api_key_from_env { Step::Model } else { Step::ApiKey };
-                        false
-                    }
-                },
-                KeyCode::Esc => true,
-                _ => false,
-            },
-            Step::Login => match key.code {
+                    self.step = Step::Model;
+                }
                 KeyCode::Enter => {
-                    if self.input.trim().is_empty() {
-                        // convenience: re-open the browser if it never opened
-                        if !self.browser_opened {
-                            self.browser_opened = crate::auth::open_browser(&self.login_url).is_ok();
-                        }
-                    } else {
-                        self.pending_login = Some((self.input.trim().to_string(), self.login_verifier.clone()));
-                        self.input.clear();
-                        self.step = Step::Model;
+                    self.cfg.backend = Backend::Api;
+                    self.step = if self.api_key_from_env { Step::Model } else { Step::ApiKey };
+                }
+                KeyCode::Esc => return true,
+                _ => {}
+            },
+            Step::ApiKey => match code {
+                KeyCode::Enter => {
+                    let key = self.input.trim();
+                    if key.is_empty() {
+                        return false;
                     }
-                    false
+                    if !key.starts_with("sk-ant-") {
+                        self.input_error = Some("that isn't an Anthropic API key (they start with sk-ant-)");
+                        return false;
+                    }
+                    self.cfg.api_key = Some(key.to_string());
+                    self.input.clear();
+                    self.input_error = None;
+                    self.step = Step::Model;
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
-                    false
                 }
                 KeyCode::Esc => {
-                    // skip sign-in; the app offers /login later
                     self.input.clear();
-                    self.step = Step::Model;
-                    false
+                    self.input_error = None;
+                    self.step = Step::SignIn;
                 }
-                KeyCode::Char(c) => {
-                    self.input.push(c);
-                    false
-                }
-                _ => false,
+                KeyCode::Char(c) => self.input.push(c),
+                _ => {}
             },
-            Step::ApiKey => match key.code {
+            Step::Model => match code {
+                KeyCode::Up | KeyCode::Down => Self::nudge(&mut self.model_sel, code, MODEL_CHOICES),
                 KeyCode::Enter => {
-                    if !self.input.trim().is_empty() {
-                        self.cfg.api_key = Some(self.input.trim().to_string());
-                        self.input.clear();
-                        self.step = Step::Model;
-                    }
-                    false
-                }
-                KeyCode::Backspace => {
-                    self.input.pop();
-                    false
-                }
-                KeyCode::Esc => true,
-                KeyCode::Char(c) => {
-                    self.input.push(c);
-                    false
-                }
-                _ => false,
-            },
-            Step::Model => match key.code {
-                KeyCode::Up => {
-                    self.model_sel = self.model_sel.saturating_sub(1);
-                    false
-                }
-                KeyCode::Down => {
-                    self.model_sel = (self.model_sel + 1).min(MODELS.len() - 1);
-                    false
-                }
-                KeyCode::Enter => {
-                    self.cfg.model = MODELS[self.model_sel].to_string();
+                    self.cfg.model = claude_code::MODELS[self.model_sel].0.to_string();
                     self.step = Step::Theme;
-                    false
                 }
-                KeyCode::Esc => true,
-                _ => false,
+                KeyCode::Esc => self.step = Step::SignIn,
+                _ => {}
             },
-            Step::Theme => match key.code {
-                KeyCode::Up => {
-                    self.theme_sel = self.theme_sel.saturating_sub(1);
-                    false
-                }
-                KeyCode::Down => {
-                    self.theme_sel = (self.theme_sel + 1).min(1);
-                    false
-                }
+            Step::Theme => match code {
+                KeyCode::Up | KeyCode::Down => Self::nudge(&mut self.theme_sel, code, self.themes.len()),
                 KeyCode::Enter => {
-                    self.cfg.theme = self.preview_themes[self.theme_sel].id.clone();
+                    self.cfg.theme = self.themes[self.theme_sel].id.clone();
                     self.step = Step::Window;
-                    false
                 }
-                KeyCode::Esc => true,
-                _ => false,
+                KeyCode::Esc => self.step = Step::Model,
+                _ => {}
             },
-            Step::Window => match key.code {
-                KeyCode::Up => {
-                    self.window_sel = self.window_sel.saturating_sub(1);
-                    false
-                }
-                KeyCode::Down => {
-                    self.window_sel = (self.window_sel + 1).min(WINDOW_PRESETS.len() - 1);
-                    false
-                }
+            Step::Window => match code {
+                KeyCode::Up | KeyCode::Down => Self::nudge(&mut self.window_sel, code, WINDOW_PRESETS.len()),
                 KeyCode::Enter => {
                     let (_, cols, rows) = WINDOW_PRESETS[self.window_sel];
                     self.cfg.window = if cols == 0 {
@@ -247,52 +251,53 @@ impl Installer {
                         WindowConfig { enabled: true, cols, rows, center: true }
                     };
                     self.step = Step::Budget;
-                    false
                 }
-                KeyCode::Esc => true,
-                _ => false,
+                KeyCode::Esc => self.step = Step::Theme,
+                _ => {}
             },
-            Step::Budget => match key.code {
-                KeyCode::Up => {
-                    self.budget_sel = self.budget_sel.saturating_sub(1);
-                    false
-                }
-                KeyCode::Down => {
-                    self.budget_sel = (self.budget_sel + 1).min(BUDGETS.len() - 1);
-                    false
-                }
+            Step::Budget => match code {
+                KeyCode::Up | KeyCode::Down => Self::nudge(&mut self.budget_sel, code, BUDGETS.len()),
                 KeyCode::Enter => {
                     self.cfg.usage_budget_daily = BUDGETS[self.budget_sel].1;
                     self.step = Step::Confirm;
-                    false
                 }
-                KeyCode::Esc => true,
-                _ => false,
+                KeyCode::Esc => self.step = Step::Window,
+                _ => {}
             },
-            Step::Confirm => match key.code {
+            Step::Confirm => match code {
                 KeyCode::Enter => {
                     self.cfg.wizard_done = true;
                     self.step = Step::Done;
-                    false
                 }
-                KeyCode::Esc => true, // abort setup; app will prompt again next run
-                _ => false,
+                KeyCode::Esc => self.step = Step::Budget,
+                _ => {}
             },
-            Step::Done => matches!(key.code, KeyCode::Enter | KeyCode::Esc),
+            Step::Done => return matches!(code, KeyCode::Enter | KeyCode::Esc),
         }
+        false
     }
+
+    // ------------------------------------------------------------- drawing
 
     fn draw(&self, f: &mut ratatui::Frame) {
         let area = f.area();
-        let w = 64.min(area.width.saturating_sub(4));
-        let h = 16.min(area.height.saturating_sub(4));
-        let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
-        let theme = &self.preview_themes[self.theme_sel];
+        let w = 66.min(area.width.saturating_sub(4));
+        let h = 18.min(area.height.saturating_sub(2));
+        let r = Rect::new(
+            area.x + area.width.saturating_sub(w) / 2,
+            area.y + area.height.saturating_sub(h) / 2,
+            w,
+            h,
+        );
+        if r.width < 8 || r.height < 4 {
+            return; // a window this small can't show anything useful
+        }
+        // the theme step previews whatever is highlighted
+        let theme = &self.themes[self.theme_sel];
 
         let (title, border) = match self.step {
             Step::Welcome => (" welcome ", theme.accent),
-            Step::AuthMethod => (" how do you sign in? ", theme.accent2),
-            Step::Login => (" claude sign-in ", theme.accent2),
+            Step::SignIn => (" how do you sign in? ", theme.accent2),
             Step::ApiKey => (" Anthropic API key ", theme.accent2),
             Step::Model => (" pick a model ", theme.accent),
             Step::Theme => (" pick a theme ", theme.accent),
@@ -301,315 +306,196 @@ impl Installer {
             Step::Confirm => (" confirm ", theme.success),
             Step::Done => (" done ", theme.success),
         };
-
         let block = Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
-            .title(Line::from(Span::styled(
-                title,
-                Style::new().fg(border).add_modifier(Modifier::BOLD),
-            )));
+            .title(Line::from(Span::styled(title, Style::new().fg(border).add_modifier(Modifier::BOLD))));
         f.render_widget(block, r);
         let inner = Rect::new(r.x + 2, r.y + 1, r.width - 4, r.height - 2);
 
-        match self.step {
-            Step::Welcome => {
-                let lines = vec![
-                    Line::from(""),
-                    Line::from(gradient_word(theme)),
-                    Line::from(Span::styled(
-                        "a galaxy-grade coding agent",
-                        Style::new().fg(theme.accent2).add_modifier(Modifier::ITALIC),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "let's set you up in a few quick steps.",
-                        Style::new().fg(theme.fg),
-                    )),
-                    Line::from(Span::styled(
-                        "you can change everything later via /setup.",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled("  [Enter]", Style::new().fg(theme.success)),
-                        Span::styled(" begin   ", Style::new().fg(theme.fg_dim)),
-                        Span::styled("[Esc]", Style::new().fg(theme.error)),
-                        Span::styled(" quit", Style::new().fg(theme.fg_dim)),
-                    ]),
-                ];
-                f.render_widget(Paragraph::new(lines), inner);
-            }
-            Step::AuthMethod => {
-                let opt = |sel: bool, label: &str| {
-                    Line::from(Span::styled(
-                        format!("  {} {label}", if sel { "◉" } else { "○" }),
-                        if sel {
-                            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::new().fg(theme.fg_dim)
-                        },
-                    ))
-                };
-                let lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "how do you want to authenticate?",
-                        Style::new().fg(theme.fg),
-                    )),
-                    Line::from(""),
-                    opt(self.auth_sel == 0, "Claude account (browser sign-in)"),
-                    Line::from(Span::styled(
-                        "    uses your Pro/Max subscription, auto-refresh",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                    Line::from(""),
-                    opt(self.auth_sel == 1, if self.api_key_from_env {
-                        "ANTHROPIC_API_KEY from env (already set ✓)"
-                    } else {
-                        "Anthropic API key (console.anthropic.com)"
-                    }),
-                    Line::from(Span::styled(
-                        "    metered pay-per-token billing",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  ↑/↓ to choose · Enter to continue",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                ];
-                f.render_widget(Paragraph::new(lines), inner);
-            }
-            Step::Login => {
-                let mut lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "sign in with your Claude account:",
-                        Style::new().fg(theme.fg),
-                    )),
-                ];
-                if self.browser_opened {
-                    lines.push(Line::from(Span::styled(
-                        "browser opened — after signing in, copy the code it shows,",
-                        Style::new().fg(theme.fg_dim),
-                    )));
+        let text = |s: String| Line::from(Span::styled(s, Style::new().fg(theme.fg)));
+        let dim = |s: String| Line::from(Span::styled(s, Style::new().fg(theme.fg_dim)));
+        let opt = |sel: bool, label: String| {
+            Line::from(Span::styled(
+                format!("  {} {label}", if sel { "◉" } else { "○" }),
+                if sel {
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
                 } else {
-                    lines.push(Line::from(Span::styled(
-                        "could not open the browser — visit this URL:",
-                        Style::new().fg(theme.warning),
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", crate::util::truncate_chars(&self.login_url, 58)),
-                        Style::new().fg(theme.accent2),
-                    )));
-                }
-                lines.push(Line::from(Span::styled(
-                    "then paste the code here and press Enter:",
-                    Style::new().fg(theme.fg_dim),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    format!("  ▸ {}", self.input),
-                    Style::new().fg(theme.accent2),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "[Esc] skip — sign in later with /login",
-                    Style::new().fg(theme.fg_dim),
-                )));
-                f.render_widget(Paragraph::new(lines), inner);
+                    Style::new().fg(theme.fg_dim)
+                },
+            ))
+        };
+        let keys = |enter: &str, esc: &str| {
+            Line::from(vec![
+                Span::styled("  [Enter]", Style::new().fg(theme.success)),
+                Span::styled(format!(" {enter}   "), Style::new().fg(theme.fg_dim)),
+                Span::styled("[Esc]", Style::new().fg(theme.error)),
+                Span::styled(format!(" {esc}"), Style::new().fg(theme.fg_dim)),
+            ])
+        };
+
+        let lines: Vec<Line> = match self.step {
+            Step::Welcome => vec![
+                Line::from(""),
+                Line::from(gradient_word(theme)),
+                Line::from(Span::styled(
+                    "a galaxy-grade coding agent",
+                    Style::new().fg(theme.accent2).add_modifier(Modifier::ITALIC),
+                )),
+                Line::from(""),
+                text("let's set you up in a few quick steps.".into()),
+                dim("you can change everything later (`beyond setup`).".into()),
+                Line::from(""),
+                keys("begin", "quit"),
+            ],
+            Step::SignIn => {
+                let claude_note = match &self.claude {
+                    ClaudeState::NotInstalled => "    not installed — npm install -g @anthropic-ai/claude-code".to_string(),
+                    ClaudeState::Checking => "    checking your sign-in…".to_string(),
+                    ClaudeState::Ready(s) if s.logged_in => match &s.plan {
+                        Some(plan) => format!("    signed in ✓ ({plan} plan) — uses your Claude plan"),
+                        None => "    signed in ✓".to_string(),
+                    },
+                    ClaudeState::Ready(_) => "    installed — Enter opens its sign-in window".to_string(),
+                };
+                let key_label = if self.api_key_from_env {
+                    "Anthropic API key (already set ✓)"
+                } else {
+                    "Anthropic API key (console.anthropic.com)"
+                };
+                vec![
+                    Line::from(""),
+                    text("which engine should answer your messages?".into()),
+                    Line::from(""),
+                    opt(self.signin_sel == 0, "Claude Code (recommended)".into()),
+                    dim(claude_note),
+                    Line::from(""),
+                    opt(self.signin_sel == 1, key_label.into()),
+                    dim("    metered pay-per-token billing".into()),
+                    Line::from(""),
+                    dim("  ↑/↓ choose · Enter continue · Esc quit".into()),
+                ]
             }
             Step::ApiKey => {
                 let masked: String = self.input.chars().map(|_| '•').collect();
-                let lines = vec![
+                let mut l = vec![
                     Line::from(""),
-                    Line::from(Span::styled(
-                        "paste your Anthropic API key (console.anthropic.com):",
-                        Style::new().fg(theme.fg),
-                    )),
+                    text("paste your Anthropic API key (console.anthropic.com):".into()),
                     Line::from(""),
-                    Line::from(Span::styled(
-                        format!("  {masked}"),
-                        Style::new().fg(theme.accent2),
-                    )),
+                    Line::from(Span::styled(format!("  ▸ {masked}"), Style::new().fg(theme.accent2))),
                     Line::from(""),
-                    Line::from(Span::styled(
-                        "stored locally in your config file only.",
-                        Style::new().fg(theme.fg_dim),
-                    )),
                 ];
-                f.render_widget(Paragraph::new(lines), inner);
+                match self.input_error {
+                    Some(e) => l.push(Line::from(Span::styled(e, Style::new().fg(theme.error)))),
+                    None => l.push(dim("stored only in your local Beyond config.".into())),
+                }
+                l.push(Line::from(""));
+                l.push(keys("save", "back"));
+                l
             }
             Step::Model => {
-                let mut lines = vec![Line::from("")];
-                for (i, m) in MODELS.iter().enumerate() {
-                    let sel = i == self.model_sel;
-                    lines.push(Line::from(Span::styled(
-                        format!("  {} {m}", if sel { "◉" } else { "○" }),
-                        if sel {
-                            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::new().fg(theme.fg_dim)
-                        },
-                    )));
+                let mut l = vec![Line::from("")];
+                for (i, (id, desc)) in claude_code::MODELS[..MODEL_CHOICES].iter().enumerate() {
+                    l.push(opt(i == self.model_sel, format!("{id:<7} {desc}")));
                 }
-                f.render_widget(Paragraph::new(lines), inner);
+                l.push(Line::from(""));
+                l.push(dim("  exact versions: /model inside the app".into()));
+                l
             }
             Step::Theme => {
-                let mut lines = vec![Line::from("")];
-                for (i, (name, t)) in [("Beyond", &self.preview_themes[0]), ("Galaxy", &self.preview_themes[1])]
-                    .iter()
-                    .enumerate()
-                {
+                // a window of rows that follows the selection
+                let start = self
+                    .theme_sel
+                    .saturating_sub(THEME_ROWS / 2)
+                    .min(self.themes.len().saturating_sub(THEME_ROWS));
+                let mut l = vec![dim(format!("  {} of {}", self.theme_sel + 1, self.themes.len()))];
+                for (i, t) in self.themes.iter().enumerate().skip(start).take(THEME_ROWS) {
                     let sel = i == self.theme_sel;
-                    let swatch: Vec<Span> = (0..10)
-                        .map(|k| Span::styled("━", Style::new().fg(t.gradient_color(k as f32 / 9.0))))
-                        .collect();
                     let mut spans = vec![Span::styled(
-                        format!("  {} {name:<8} ", if sel { "◉" } else { "○" }),
+                        format!("  {} {:<16} ", if sel { "◉" } else { "○" }, t.name),
                         if sel {
                             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
                         } else {
                             Style::new().fg(theme.fg_dim)
                         },
                     )];
-                    spans.extend(swatch);
-                    lines.push(Line::from(spans));
+                    spans.extend(
+                        (0..12).map(|k| Span::styled("━", Style::new().fg(t.gradient_color(k as f32 / 11.0)))),
+                    );
+                    l.push(Line::from(spans));
                 }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "  themes are fully customizable — /loadtheme <file.json>",
-                    Style::new().fg(theme.fg_dim),
-                )));
-                f.render_widget(Paragraph::new(lines), inner);
+                l.push(Line::from(""));
+                l.push(dim("  custom themes: /loadtheme <file.json>".into()));
+                l
             }
             Step::Window => {
-                let mut lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "resize the console window on launch:",
-                        Style::new().fg(theme.fg),
-                    )),
-                    Line::from(""),
-                ];
+                let mut l = vec![Line::from(""), text("resize the console window on launch:".into()), Line::from("")];
                 for (i, (label, _, _)) in WINDOW_PRESETS.iter().enumerate() {
-                    let sel = i == self.window_sel;
-                    lines.push(Line::from(Span::styled(
-                        format!("  {} {label}", if sel { "◉" } else { "○" }),
-                        if sel {
-                            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::new().fg(theme.fg_dim)
-                        },
-                    )));
+                    l.push(opt(i == self.window_sel, label.to_string()));
                 }
-                f.render_widget(Paragraph::new(lines), inner);
+                l.push(Line::from(""));
+                l.push(dim("  (Windows Terminal sizes itself; this is for the classic console)".into()));
+                l
             }
             Step::Budget => {
-                let mut lines = vec![
+                let mut l = vec![
                     Line::from(""),
-                    Line::from(Span::styled(
-                        "soft daily token budget (shown in the status bar",
-                        Style::new().fg(theme.fg),
-                    )),
-                    Line::from(Span::styled(
-                        "and included in /later reminders):",
-                        Style::new().fg(theme.fg),
-                    )),
+                    text("soft daily token budget (shown in the status bar):".into()),
                     Line::from(""),
                 ];
                 for (i, (label, _)) in BUDGETS.iter().enumerate() {
-                    let sel = i == self.budget_sel;
-                    lines.push(Line::from(Span::styled(
-                        format!("  {} {label}", if sel { "◉" } else { "○" }),
-                        if sel {
-                            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::new().fg(theme.fg_dim)
-                        },
-                    )));
+                    l.push(opt(i == self.budget_sel, label.to_string()));
                 }
-                f.render_widget(Paragraph::new(lines), inner);
+                l
             }
             Step::Confirm => {
-                let key_state = if self.cfg.oauth.is_some() || self.pending_login.is_some() {
-                    "claude account ✓"
-                } else if self.cfg.api_key.is_some() {
-                    "api key ✓"
-                } else {
-                    "missing!"
+                let (signin, ok) = match self.cfg.backend {
+                    Backend::Api if self.cfg.has_auth() => ("API key ✓".to_string(), true),
+                    Backend::Api => ("no API key yet — `/login key` in the app".to_string(), false),
+                    _ if self.claude_signed_in() => ("Claude Code ✓".to_string(), true),
+                    _ => ("Claude Code — finish its sign-in window".to_string(), false),
                 };
                 let (_, wcols, wrows) = WINDOW_PRESETS[self.window_sel];
-                let win_state = if wcols == 0 {
-                    "system default".to_string()
-                } else {
-                    format!("{wcols} × {wrows}, centered")
-                };
-                let lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled("  sign-in:      ", Style::new().fg(theme.fg_dim))),
-                    Line::from(Span::styled(format!("  {key_state}"), Style::new().fg(theme.success))),
-                    Line::from(Span::styled(format!("  model:        {}", self.cfg.model), Style::new().fg(theme.fg))),
-                    Line::from(Span::styled(format!("  theme:        {}", self.cfg.theme), Style::new().fg(theme.fg))),
-                    Line::from(Span::styled(format!("  window:       {win_state}"), Style::new().fg(theme.fg))),
-                    Line::from(Span::styled(
-                        format!("  daily budget: {}", BUDGETS[self.budget_sel].0),
-                        Style::new().fg(theme.fg),
-                    )),
+                let window = if wcols == 0 { "system default".to_string() } else { format!("{wcols} × {wrows}, centered") };
+                vec![
                     Line::from(""),
                     Line::from(vec![
-                        Span::styled("  [Enter]", Style::new().fg(theme.success)),
-                        Span::styled(" finish setup   ", Style::new().fg(theme.fg_dim)),
-                        Span::styled("[Esc]", Style::new().fg(theme.error)),
-                        Span::styled(" abort", Style::new().fg(theme.fg_dim)),
+                        Span::styled("  sign-in:      ", Style::new().fg(theme.fg_dim)),
+                        Span::styled(signin, Style::new().fg(if ok { theme.success } else { theme.warning })),
                     ]),
-                ];
-                f.render_widget(Paragraph::new(lines), inner);
-            }
-            Step::Done => {
-                let lines = vec![
+                    text(format!("  model:        {}", claude_code::MODELS[self.model_sel].0)),
+                    text(format!("  theme:        {}", self.themes[self.theme_sel].name)),
+                    text(format!("  window:       {window}")),
+                    text(format!("  daily budget: {}", BUDGETS[self.budget_sel].0)),
                     Line::from(""),
-                    Line::from(Span::styled("  ✓ setup complete", Style::new().fg(theme.success))),
-                    Line::from(Span::styled(
-                        "  ExtraResources created at:",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                    Line::from(Span::styled(
-                        format!("    {}", crate::config::Paths::extra_resources_dir().display()),
-                        Style::new().fg(theme.accent2),
-                    )),
-                    Line::from(Span::styled(
-                        "    MCPs/ — drop MCP.exe / MCP.py servers here",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                    Line::from(Span::styled(
-                        "    Skills/ — markdown skills the agent learns from",
-                        Style::new().fg(theme.fg_dim),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  launching Beyond CLI…",
-                        Style::new().fg(theme.fg),
-                    )),
-                ];
-                f.render_widget(Paragraph::new(lines), inner);
+                    keys("finish setup", "back"),
+                ]
             }
-        }
+            Step::Done => vec![
+                Line::from(""),
+                Line::from(Span::styled("  ✓ setup complete", Style::new().fg(theme.success))),
+                dim("  ExtraResources created at:".into()),
+                Line::from(Span::styled(
+                    format!("    {}", crate::config::Paths::extra_resources_dir().display()),
+                    Style::new().fg(theme.accent2),
+                )),
+                dim("    MCPs/ — drop MCP servers (.exe, .py, .js) here".into()),
+                dim("    Skills/ — markdown skills the agent learns from".into()),
+                Line::from(""),
+                text("  press Enter to launch Beyond CLI".into()),
+            ],
+        };
+        f.render_widget(Paragraph::new(lines), inner);
     }
 }
 
 fn gradient_word(theme: &Theme) -> Vec<Span<'static>> {
     let word = "✦ BEYOND CLI";
+    let n = word.chars().count() as f32;
     word.chars()
         .enumerate()
-        .map(|(i, ch)| {
-            Span::styled(
-                ch.to_string(),
-                Style::new().fg(theme.gradient_color(i as f32 / word.chars().count() as f32)),
-            )
-        })
+        .map(|(i, ch)| Span::styled(ch.to_string(), Style::new().fg(theme.gradient_color(i as f32 / n))))
         .collect()
 }
 
@@ -643,4 +529,56 @@ pub fn seed_extra_resources() -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn press(inst: &mut Installer, code: KeyCode) -> bool {
+        inst.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn wizard() -> Installer {
+        Installer::new(Config { api_key: None, ..Config::default() })
+    }
+
+    #[test]
+    fn api_key_path_validates_then_finishes() {
+        let mut w = wizard();
+        press(&mut w, KeyCode::Enter); // welcome
+        // Claude Code is missing: Enter on it does nothing
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.step, Step::SignIn);
+        press(&mut w, KeyCode::Down);
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.step, Step::ApiKey);
+        for c in "nope".chars() {
+            press(&mut w, KeyCode::Char(c));
+        }
+        press(&mut w, KeyCode::Enter);
+        assert!(w.input_error.is_some() && w.cfg.api_key.is_none());
+        w.input = "sk-ant-test".into();
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.cfg.api_key.as_deref(), Some("sk-ant-test"));
+        for _ in 0..5 {
+            press(&mut w, KeyCode::Enter); // model, theme, window, budget, confirm
+        }
+        assert!(w.cfg.wizard_done && w.cfg.backend == Backend::Api);
+        assert!(press(&mut w, KeyCode::Enter));
+    }
+
+    #[test]
+    fn esc_goes_back_and_every_theme_is_offered() {
+        let mut w = wizard();
+        assert_eq!(w.themes.len(), 25);
+        w.step = Step::Theme;
+        for _ in 0..40 {
+            press(&mut w, KeyCode::Down);
+        }
+        assert_eq!(w.theme_sel, 24);
+        press(&mut w, KeyCode::Esc);
+        assert_eq!(w.step, Step::Model);
+    }
 }

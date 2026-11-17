@@ -542,7 +542,7 @@ impl App {
     fn begin_login(&mut self, limited: bool) {
         const KEYS_URL: &str = "https://console.anthropic.com/settings/keys";
         // tests must not pop a browser window
-        let opened = !cfg!(test) && crate::auth::open_browser(KEYS_URL).is_ok();
+        let opened = !cfg!(test) && crate::util::open_browser(KEYS_URL).is_ok();
         self.push(
             EntryKind::Info,
             if opened {
@@ -571,7 +571,6 @@ impl App {
         let expires = limited.then(|| chrono::Utc::now().timestamp().max(0) as u64 + LIMITED_LOGIN_SECS);
         self.persist(|c| {
             c.api_key = Some(text.clone());
-            c.oauth = None;
             c.auth_expires_at = expires;
         });
         self.push(

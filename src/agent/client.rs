@@ -1,8 +1,6 @@
-//! Streaming client for the Anthropic Messages API.
-//!
-//! Supports two auth modes (see [`Auth`]): a classic API key, or a Claude
-//! account OAuth token pair (Pro/Max subscription) which is transparently
-//! refreshed before expiry and persisted back into `config.json`.
+//! Streaming client for the Anthropic Messages API, authenticated with the
+//! user's own API key. (Subscription use goes through the official Claude
+//! Code CLI instead — see [`super::claude_code`].)
 //!
 //! Emits [`StreamEvent`]s over a channel while the response streams in, so the
 //! TUI can render text and tool calls live. Tool_use blocks are reassembled
@@ -11,8 +9,9 @@
 use super::types::{Message, ToolDef, Usage};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 pub const API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const API_VERSION: &str = "2023-06-01";
@@ -20,22 +19,19 @@ pub const API_VERSION: &str = "2023-06-01";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Kill the stream when no chunk arrives for this long (stalled network).
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
-/// Refresh OAuth tokens this many seconds before they actually expire.
-const REFRESH_SLACK: u64 = 120;
 
-/// How the client authenticates against the Anthropic API.
-#[derive(Debug, Clone)]
-pub enum Auth {
-    /// A metered console API key (`x-api-key` header).
-    ApiKey(String),
-    /// Claude account login (subscription usage). Uses `Authorization: Bearer`
-    /// plus the `anthropic-beta: oauth-2025-04-20` opt-in header.
-    OAuth {
-        access_token: String,
-        refresh_token: String,
-        /// Unix seconds when `access_token` expires (0 = unknown).
-        expires_at: u64,
-    },
+/// One HTTP client for the whole process, so TLS sessions and connections
+/// are reused across turns instead of renegotiated for every model call.
+fn http() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let built = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .context("building HTTP client")?;
+    Ok(CLIENT.get_or_init(|| built))
 }
 
 /// Events produced while streaming a model turn.
@@ -53,79 +49,28 @@ pub enum StreamEvent {
     Failed(String),
 }
 
-#[derive(Debug)]
 pub struct AnthropicClient {
-    /// Wrapped in a mutex so an in-flight refresh is visible to later turns
-    /// (each turn constructs a fresh `Agent`, but tokens outlive turns).
-    pub auth: Mutex<Auth>,
+    api_key: String,
     pub model: String,
     pub max_tokens: u32,
 }
 
 impl AnthropicClient {
-    pub fn new(auth: Auth, model: String, max_tokens: u32) -> Self {
-        Self { auth: Mutex::new(auth), model, max_tokens }
-    }
-
-    /// Ensure OAuth tokens are fresh; refresh + persist them if not.
-    /// Returns `Err` only when the refresh itself fails.
-    async fn ensure_fresh(&self) -> Result<()> {
-        let mut guard = self.auth.lock().await;
-        let Auth::OAuth { access_token, refresh_token, expires_at } = &*guard else {
-            return Ok(()); // API-key mode: nothing to refresh
-        };
-        let creds = crate::config::OAuthCreds {
-            access_token: access_token.clone(),
-            refresh_token: refresh_token.clone(),
-            expires_at: *expires_at,
-        };
-        if !creds.needs_refresh(REFRESH_SLACK) {
-            return Ok(());
-        }
-        let fresh = crate::auth::refresh_tokens(&creds.refresh_token)
-            .await
-            .context("refreshing Claude login")?;
-        let new_creds = crate::config::OAuthCreds {
-            access_token: fresh.access_token.clone(),
-            refresh_token: if fresh.refresh_token.is_empty() {
-                creds.refresh_token.clone()
-            } else {
-                fresh.refresh_token.clone()
-            },
-            expires_at: chrono::Utc::now().timestamp() as u64 + fresh.expires_in,
-        };
-        // Persist so restarts (and other turns) see the new tokens.
-        let _ = crate::config::update(|c| c.oauth = Some(new_creds.clone()));
-        *guard = Auth::OAuth {
-            access_token: new_creds.access_token,
-            refresh_token: new_creds.refresh_token,
-            expires_at: new_creds.expires_at,
-        };
-        Ok(())
+    pub fn new(api_key: String, model: String, max_tokens: u32) -> Self {
+        Self { api_key, model, max_tokens }
     }
 
     /// Start a streaming turn. Returns a receiver of events; the HTTP/SSE work
     /// runs on a background task so the caller never blocks the UI thread.
-    ///
-    /// In OAuth mode the system prompt is prefixed with the Claude Code
-    /// identity line the subscription endpoint requires.
     pub async fn stream(
         &self,
         system: &str,
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<mpsc::UnboundedReceiver<StreamEvent>> {
-        self.ensure_fresh().await?;
-        let (auth_snapshot, is_oauth) = {
-            let guard = self.auth.lock().await;
-            (guard.clone(), matches!(&*guard, Auth::OAuth { .. }))
-        };
-        let system = if is_oauth {
-            format!("{}. {system}", crate::auth::OAUTH_SYSTEM_PREFIX)
-        } else {
-            system.to_string()
-        };
-
+        if self.api_key.trim().is_empty() {
+            anyhow::bail!("no API key — run `/login key`");
+        }
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -136,8 +81,9 @@ impl AnthropicClient {
         });
 
         let (tx, rx) = mpsc::unbounded_channel();
+        let key = self.api_key.clone();
         tokio::spawn(async move {
-            if let Err(e) = stream_once(auth_snapshot, body, tx.clone()).await {
+            if let Err(e) = stream_once(&key, body, tx.clone()).await {
                 let _ = tx.send(StreamEvent::Failed(format!("{e:#}")));
             }
         });
@@ -145,33 +91,12 @@ impl AnthropicClient {
     }
 }
 
-impl Auth {
-    /// Apply this auth mode to an outgoing request builder.
-    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self {
-            Auth::ApiKey(key) => req
-                .header("x-api-key", key)
-                .header("anthropic-version", API_VERSION),
-            Auth::OAuth { access_token, .. } => req
-                .header("Authorization", format!("Bearer {access_token}"))
-                .header("anthropic-version", API_VERSION)
-                .header("anthropic-beta", crate::auth::OAUTH_BETA),
-        }
-    }
-}
-
 /// Perform one streamed request, forwarding parsed SSE events into `tx`.
-async fn stream_once(
-    auth: Auth,
-    body: serde_json::Value,
-    tx: mpsc::UnboundedSender<StreamEvent>,
-) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .context("building HTTP client")?;
-    let resp = auth
-        .apply(client.post(API_URL))
+async fn stream_once(api_key: &str, body: serde_json::Value, tx: mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+    let resp = http()?
+        .post(API_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
         .json(&body)
         .send()
@@ -189,9 +114,12 @@ async fn stream_once(
         anyhow::bail!("API {status}: {msg}");
     }
 
-    // Stream raw bytes and split on SSE event boundaries ("\n\n").
+    // Stream raw bytes and split on SSE event boundaries ("\n\n"). The buffer
+    // stays bytes until a whole event is in: a network chunk can end in the
+    // middle of a multi-byte character (é, ő, emoji), and decoding chunks one
+    // by one would turn those into U+FFFD.
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     // Usage accumulates across message_start / message_delta events.
     let mut usage = Usage::default();
 
@@ -207,11 +135,10 @@ async fn stream_once(
             Ok(Some(c)) => c,
         };
         let chunk = chunk.context("stream interrupted")?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
         // Process all complete events currently buffered.
-        while let Some(pos) = buf.find("\n\n") {
-            let event: String = buf.drain(..pos + 2).collect();
+        while let Some(event) = take_event(&mut buf) {
             match parse_sse_event(&event) {
                 Some(SseEvent::Stream(ev)) => {
                     if tx.send(ev).is_err() {
@@ -237,6 +164,14 @@ async fn stream_once(
         }
     }
     Ok(())
+}
+
+/// Cut the first complete SSE event (up to and including its blank line)
+/// off the front of `buf`, decoded only now that all its bytes are here.
+fn take_event(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf.windows(2).position(|w| w == b"\n\n")?;
+    let raw: Vec<u8> = buf.drain(..pos + 2).collect();
+    Some(String::from_utf8_lossy(&raw).into_owned())
 }
 
 /// What one SSE block yields: a UI event, a partial usage update, or end.
@@ -303,5 +238,31 @@ fn parse_sse_event(block: &str) -> Option<SseEvent> {
             Some(SseEvent::Stream(StreamEvent::Failed(msg.to_string())))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn characters_split_across_chunks_survive() {
+        let event = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"szőlő 🍇\"}}\n\n";
+        let bytes = event.as_bytes();
+        // cut inside the 2-byte "ő" and again inside the 4-byte emoji
+        let cut1 = event.find('ő').unwrap() + 1;
+        let cut2 = event.find('🍇').unwrap() + 2;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&bytes[..cut1]);
+        assert!(take_event(&mut buf).is_none());
+        buf.extend_from_slice(&bytes[cut1..cut2]);
+        assert!(take_event(&mut buf).is_none());
+        buf.extend_from_slice(&bytes[cut2..]);
+        let got = take_event(&mut buf).unwrap();
+        assert!(buf.is_empty());
+        match parse_sse_event(&got) {
+            Some(SseEvent::Stream(StreamEvent::TextDelta(t))) => assert_eq!(t, "szőlő 🍇"),
+            _ => panic!("expected a text delta"),
+        }
     }
 }

@@ -108,6 +108,26 @@ pub fn resolve_model(input: &str) -> Result<String, String> {
     Err("unknown model — `/model` opens the list (fable, opus, sonnet, haiku and their versions)".into())
 }
 
+/// The id to send to the Messages API. Claude Code understands the family
+/// aliases (`opus`, `sonnet`, …) but the API needs a real model id, so on
+/// the API-key backend an alias means that family's current version.
+pub fn api_model_id(model: &str) -> String {
+    let current = |family: &str| {
+        MODELS
+            .iter()
+            .find(|(id, desc)| id.starts_with(&format!("claude-{family}-")) && desc.contains("current"))
+            .or_else(|| MODELS.iter().find(|(id, _)| id.starts_with(&format!("claude-{family}-"))))
+            .map(|(id, _)| id.to_string())
+    };
+    // `opus[1m]` is a Claude Code spelling; the API takes the plain id
+    let base = model.split('[').next().unwrap_or(model);
+    if FAMILIES.contains(&base) {
+        current(base).unwrap_or_else(|| model.to_string())
+    } else {
+        base.to_string()
+    }
+}
+
 /// Friendly name for a model id from the list ("Opus 5.5"), if it has one.
 pub fn model_label(id: &str) -> Option<&'static str> {
     let (_, desc) = MODELS.iter().find(|(m, _)| *m == id)?;
@@ -515,6 +535,16 @@ mod tests {
         assert!(resolve_model("").is_err());
         assert_eq!(model_label("claude-opus-5-5"), Some("Opus 5.5"));
         assert_eq!(model_label("opus"), None);
+    }
+
+    #[test]
+    fn aliases_become_real_ids_for_the_api() {
+        assert_eq!(api_model_id("opus"), "claude-opus-5-5");
+        assert_eq!(api_model_id("sonnet"), "claude-sonnet-5-5");
+        assert_eq!(api_model_id("haiku"), "claude-haiku-5-5");
+        assert_eq!(api_model_id("fable"), "claude-fable-5-2");
+        assert_eq!(api_model_id("claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(api_model_id("sonnet[1m]"), "claude-sonnet-5-5");
     }
 
     fn run(lines: &[&str]) -> (Vec<AgentEvent>, TurnOutcome, StreamState) {

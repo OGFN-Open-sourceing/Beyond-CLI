@@ -131,27 +131,6 @@ impl UsageState {
     }
 }
 
-/// OAuth credentials from a Claude account login (`/login`).
-/// Lets the app run on a Pro/Max subscription instead of an API key.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct OAuthCreds {
-    #[serde(default)]
-    pub access_token: String,
-    #[serde(default)]
-    pub refresh_token: String,
-    /// Unix timestamp (seconds) when `access_token` expires.
-    #[serde(default)]
-    pub expires_at: u64,
-}
-
-impl OAuthCreds {
-    /// True when the access token is missing or expires within `slack` seconds.
-    pub fn needs_refresh(&self, slack: u64) -> bool {
-        self.access_token.is_empty()
-            || self.expires_at <= chrono::Utc::now().timestamp().saturating_add(slack as i64) as u64
-    }
-}
-
 /// What the `/env` wizard learned about the user's machine setup.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EnvProfile {
@@ -172,10 +151,8 @@ pub struct Config {
     /// Anthropic API key; falls back to `ANTHROPIC_API_KEY` when `None`.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Claude account OAuth credentials (set by `/login`); takes priority
-    /// over `api_key` when present.
-    #[serde(default)]
-    pub oauth: Option<OAuthCreds>,
+    // (Older builds stored Claude account tokens under `oauth`; serde skips
+    // that field now and the next save drops it from the file.)
     /// Unix seconds after which stored credentials are wiped (`/limitedlogin`
     /// sets this to now + 48 h; `None` = the login never expires).
     #[serde(default)]
@@ -220,7 +197,8 @@ fn default_permission_mode() -> String {
     "acceptEdits".into()
 }
 fn default_model() -> String {
-    "claude-sonnet-4-5".into()
+    // an alias: always the newest Sonnet (mapped to a full id on the API backend)
+    "sonnet".into()
 }
 fn default_theme() -> String {
     "beyond".into()
@@ -233,7 +211,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-            oauth: None,
             auth_expires_at: None,
             model: default_model(),
             theme: default_theme(),
@@ -253,9 +230,9 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Any usable credential stored (API key or Claude account tokens)?
+    /// Is an API key stored (Beyond's only credential of its own)?
     pub fn has_auth(&self) -> bool {
-        self.oauth.is_some() || self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+        self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
     }
 
     /// True once a `/limitedlogin` window has run out.
@@ -267,7 +244,6 @@ impl Config {
     /// Forget every stored credential (used by `/logout` and login expiry).
     pub fn clear_auth(&mut self) {
         self.api_key = None;
-        self.oauth = None;
         self.auth_expires_at = None;
     }
 }
@@ -339,16 +315,18 @@ pub fn load() -> Result<Config> {
     let file = Paths::config_file();
     let cfg = if file.exists() {
         let raw = std::fs::read_to_string(&file).context("reading config.json")?;
-        // corrupt file → defaults instead of a crash; user can re-run setup
-        let cfg: Config = serde_json::from_str(&raw).unwrap_or_default();
-        cfg
+        match serde_json::from_str(&raw) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                // corrupt file → defaults instead of a crash, but keep the
+                // original so the next save doesn't destroy the user's settings
+                let _ = std::fs::copy(&file, file.with_extension("json.broken"));
+                Config::default()
+            }
+        }
     } else {
-        let cfg = Config {
-            api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-            oauth: None,
-            ..Config::default()
-        };
-        std::fs::write(&file, serde_json::to_string_pretty(&cfg)?)?;
+        let cfg = Config::default();
+        write_atomic(&file, &serde_json::to_string_pretty(&cfg)?)?;
         cfg
     };
     *CONFIG.lock().unwrap() = Some(cfg.clone());
@@ -359,22 +337,24 @@ pub fn load() -> Result<Config> {
 pub fn save(cfg: &Config) -> Result<()> {
     let file = Paths::config_file();
     std::fs::create_dir_all(file.parent().unwrap())?;
-    std::fs::write(&file, serde_json::to_string_pretty(cfg)?)?;
+    write_atomic(&file, &serde_json::to_string_pretty(cfg)?)?;
     *CONFIG.lock().unwrap() = Some(cfg.clone());
     Ok(())
 }
 
-/// Copy of the process-wide config (includes changes made by background
-/// tasks, e.g. refreshed OAuth tokens, that a caller's own clone lacks).
-pub fn snapshot() -> Option<Config> {
-    CONFIG.lock().unwrap().clone()
+/// Write to a temp file, then rename over the target: a crash or full disk
+/// mid-write leaves the old config intact instead of a truncated one.
+fn write_atomic(file: &std::path::Path, contents: &str) -> Result<()> {
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, file).with_context(|| format!("replacing {}", file.display()))?;
+    Ok(())
 }
 
 /// Apply an in-place change to the current config and persist it.
 ///
-/// Used by background tasks (e.g. OAuth token refresh) that must update a
-/// field without clobbering other fields the user may have changed since
-/// the task started (we mutate the *process-wide* copy, not a stale clone).
+/// Mutates the *process-wide* copy rather than a caller's possibly stale
+/// clone, so concurrent changes to other fields aren't clobbered.
 pub fn update(f: impl FnOnce(&mut Config)) -> Result<()> {
     let mut guard = CONFIG.lock().unwrap();
     let cfg = guard.get_or_insert_with(Config::default);

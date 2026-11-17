@@ -978,6 +978,11 @@ pub fn resolve(id: &str) -> Result<Theme> {
     anyhow::bail!("unknown theme '{id}' — use /theme to pick one, or /loadtheme <file.json>")
 }
 
+/// Every built-in theme, in picker order.
+pub fn builtins() -> Vec<Theme> {
+    BUILTINS.iter().map(|make| make()).collect()
+}
+
 /// (id, display name) list for the `/theme` picker: builtins + customs.
 pub fn available_themes() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = BUILTINS

@@ -5,7 +5,6 @@
 //! main chat loop → cleanup (MCP shutdown, terminal restore).
 
 mod agent;
-mod auth;
 mod commands;
 mod config;
 mod installer;
@@ -76,35 +75,17 @@ async fn run() -> Result<()> {
     let mut cfg = config::load().context("loading config")?;
 
     // --- first-run setup wizard (MSI-like experience) -----------------
-    // any auth path (OAuth creds or API key) counts as "set up"
     let need_setup = match cli.command {
         Some(Commands::Setup) => true,
-        None => !cfg.wizard_done && cfg.api_key.is_none() && cfg.oauth.is_none(),
+        None => !cfg.wizard_done && !cfg.has_auth(),
     };
     if need_setup {
         let mut term = ui::init()?;
         let mut inst = installer::Installer::new(cfg.clone());
-        let _ = inst.run(&mut term)?;
-        cfg = inst.cfg.clone();
-        let pending_login = inst.pending_login.clone();
-        drop(inst);
+        let finished = inst.run(&mut term);
         ui::restore();
-
-        // The wizard collects the OAuth code; the exchange needs the async
-        // runtime, so it happens here — right after the wizard closes.
-        if let Some((code, verifier)) = pending_login {
-            match auth::exchange_code(&code, &verifier).await {
-                Ok(t) => {
-                    cfg.oauth = Some(config::OAuthCreds {
-                        access_token: t.access_token,
-                        refresh_token: if t.refresh_token.is_empty() { verifier } else { t.refresh_token },
-                        expires_at: chrono::Utc::now().timestamp() as u64 + t.expires_in,
-                    });
-                    println!("✓ signed in with your Claude account");
-                }
-                Err(e) => eprintln!("! sign-in failed: {e:#} — run /login inside the app"),
-            }
-        }
+        finished?;
+        cfg = inst.cfg;
         config::save(&cfg)?;
     }
     installer::seed_extra_resources()?;

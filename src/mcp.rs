@@ -3,7 +3,7 @@
 //! Discovers MCP servers dropped into `ExtraResources/MCPs/` (`.exe`, `.py`,
 //! `.js`, `.cmd`/`.bat`), speaks JSON-RPC over stdio (initialize →
 //! tools/list → tools/call) and exposes their tools to the model as
-//! `mcp:<server>/<tool>` so they merge seamlessly with built-in tools.
+//! `mcp__<server>__<tool>` so they merge seamlessly with built-in tools.
 
 use crate::agent::types::ToolDef;
 use anyhow::{anyhow, Context, Result};
@@ -79,26 +79,26 @@ impl McpManager {
         let mut out = Vec::new();
         for s in &self.servers {
             for t in &s.tools {
+                // the API requires an object schema; some servers omit it
+                let schema = if t.schema.is_object() { t.schema.clone() } else { json!({ "type": "object" }) };
                 out.push(ToolDef {
-                    name: format!("mcp:{}/{}", s.name, t.name),
+                    name: api_tool_name(&s.name, &t.name),
                     description: format!("[MCP:{}] {}", s.name, t.description),
-                    input_schema: t.schema.clone(),
+                    input_schema: schema,
                 });
             }
         }
         out
     }
 
-    /// Call a tool on a specific server.
-    pub async fn call_tool(
-        &self,
-        server: &str,
-        tool: &str,
-        args: Value,
-    ) -> crate::agent::types::ToolOutcome {
+    /// Call a tool by the name the model saw (see [`api_tool_name`]).
+    pub async fn call_tool(&self, api_name: &str, args: Value) -> crate::agent::types::ToolOutcome {
         use crate::agent::types::ToolOutcome;
-        let Some(s) = self.servers.iter().find(|s| s.name == server) else {
-            return ToolOutcome::err(format!("MCP server '{server}' is not running"));
+        let found = self.servers.iter().find_map(|s| {
+            s.tools.iter().find(|t| api_tool_name(&s.name, &t.name) == api_name).map(|t| (s, t.name.as_str()))
+        });
+        let Some((s, tool)) = found else {
+            return ToolOutcome::err(format!("no running MCP server offers '{api_name}'"));
         };
         match s.call("tools/call", json!({ "name": tool, "arguments": args })).await {
             Ok(res) => {
@@ -132,6 +132,20 @@ impl McpManager {
             let _ = c.kill().await;
         }
     }
+}
+
+/// The name an MCP tool is exposed under: `mcp__<server>__<tool>`.
+///
+/// The Messages API only accepts tool names made of `[A-Za-z0-9_-]`, at most
+/// 128 long; anything else is replaced so one odd server name can't make
+/// every request fail.
+pub fn api_tool_name(server: &str, tool: &str) -> String {
+    let clean = |s: &str| -> String {
+        s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    };
+    let mut name = format!("mcp__{}__{}", clean(server), clean(tool));
+    name.truncate(128); // all ASCII by now, so this is a char boundary
+    name
 }
 
 fn is_server_file(p: &Path) -> bool {
@@ -258,5 +272,18 @@ impl McpServer {
         stdin.write_all(format!("{msg}\n").as_bytes()).await?;
         stdin.flush().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_tool_name;
+
+    #[test]
+    fn tool_names_are_valid_for_the_api() {
+        assert_eq!(api_tool_name("fmodel", "find_assets"), "mcp__fmodel__find_assets");
+        let odd = api_tool_name("my server.v2", "do/thing:now");
+        assert!(odd.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{odd}");
+        assert!(api_tool_name(&"s".repeat(100), &"t".repeat(100)).len() <= 128);
     }
 }

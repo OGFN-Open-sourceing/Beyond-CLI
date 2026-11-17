@@ -66,9 +66,34 @@ pub fn browse_folder(title: &str) -> Result<Option<PathBuf>> {
     }
 }
 
+/// Open a URL in the user's default browser.
+pub fn open_browser(url: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // the empty "" is `start`'s window title, so the URL isn't taken as one
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .context("failed to open browser")?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().context("failed to open browser")?;
+    }
+    Ok(())
+}
+
 /// Escape a string for embedding inside single-quoted PowerShell literals.
 fn ps_escape(s: &str) -> String {
     s.replace('\'', "''").replace(['\r', '\n'], " ")
+}
+
+/// Escape text placed inside the toast's XML (`<`, `&` would break LoadXml).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// Send a Windows toast notification (falls back to a message box if WinRT
@@ -78,8 +103,9 @@ fn ps_escape(s: &str) -> String {
 /// dropped silently — reusing PowerShell's own registered app id works on
 /// every stock Windows install.
 pub fn send_toast(title: &str, message: &str) -> Result<bool> {
-    let title = ps_escape(title);
-    let message = ps_escape(message);
+    // the toast gets XML-escaped text; the message-box fallback gets it raw
+    let (title_raw, message_raw) = (ps_escape(title), ps_escape(message));
+    let (title, message) = (ps_escape(&xml_escape(title)), ps_escape(&xml_escape(message)));
     let script = format!(
         "try {{ \
            $ErrorActionPreference = 'Stop'; \
@@ -91,7 +117,7 @@ pub fn send_toast(title: &str, message: &str) -> Result<bool> {
            Write-Output 'toast-ok' \
          }} catch {{ \
            Add-Type -AssemblyName System.Windows.Forms; \
-           [System.Windows.Forms.MessageBox]::Show('{message}', '{title}') | Out-Null; \
+           [System.Windows.Forms.MessageBox]::Show('{message_raw}', '{title_raw}') | Out-Null; \
            Write-Output 'msgbox-ok' \
          }}"
     );
